@@ -1,0 +1,19 @@
+{
+  "name": "meetin-kyc-server",
+  "version": "1.0.0",
+  "description": "KYC verification bridge for MeetIn app",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "axios": "^1.7.7",
+    "firebase-admin": "^12.6.0",
+    "form-data": "^4.0.1",
+    "body-parser": "^1.20.3"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}

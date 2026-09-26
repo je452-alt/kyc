@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: meetin-kyc-server
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: ID_ANALYZER_API_KEY
+        sync: false
+      - key: FIREBASE_DB_URL
+        value: https://meetin-3e70e-default-rtdb.firebaseio.com
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      - key: UPSTASH_BLOB_BUCKET
+        value: meetin-kyc
