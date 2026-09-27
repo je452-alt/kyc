@@ -1,7 +1,6 @@
 /**
- * MeetIn KYC Server
- * Receives document from Android app, uploads to Upstash Redis,
- * calls ID Analyzer, saves result to Firebase Realtime Database
+ * MeetIn KYC Server — Hybrid ID Analyzer
+ * Tries multipart first, falls back to JSON base64
  */
 
 const express = require('express');
@@ -11,7 +10,7 @@ const FormData = require('form-data');
 const bodyParser = require('body-parser');
 
 // ============================================================
-// CONFIGURATION
+// CONFIG
 // ============================================================
 const ID_ANALYZER_API_KEY = process.env.ID_ANALYZER_API_KEY;
 const ID_ANALYZER_ENDPOINT = 'https://api2.idanalyzer.com/scan';
@@ -36,9 +35,8 @@ let serviceAccount;
 try {
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
         const raw = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
-        let decoded;
         try {
-            decoded = Buffer.from(raw, 'base64').toString('utf-8');
+            const decoded = Buffer.from(raw, 'base64').toString('utf-8');
             serviceAccount = JSON.parse(decoded);
             console.log('✅ Parsed FIREBASE_SERVICE_ACCOUNT as base64');
         } catch (e1) {
@@ -61,14 +59,13 @@ try {
 const db = admin.database();
 
 // ============================================================
-// UPSTASH REDIS UPLOAD (FIXED)
+// UPSTASH REDIS UPLOAD
 // ============================================================
 async function uploadToUpstash(deviceId, timestamp, base64Data) {
     const key = `${UPSTASH_BLOB_BUCKET}/${deviceId}_${timestamp}`;
     const url = `${UPSTASH_REDIS_REST_URL}/set/${encodeURIComponent(key)}`;
 
     try {
-        console.log(`📤 Uploading to Upstash: ${url}`);
         const response = await axios.post(url, base64Data, {
             headers: {
                 'Authorization': `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
@@ -78,21 +75,101 @@ async function uploadToUpstash(deviceId, timestamp, base64Data) {
             maxContentLength: Infinity,
             maxBodyLength: Infinity
         });
-
-        console.log(`📤 Upstash OK: ${JSON.stringify(response.data).substring(0, 100)}`);
+        console.log(`📤 Upstash OK: ${key}`);
         return {
             url: `${UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(key)}`,
             key: key,
             success: true
         };
     } catch (error) {
-        console.error('⚠️ Upstash error details:');
-        console.error('   Message:', error.message);
-        if (error.response) {
-            console.error('   Status:', error.response.status);
-            console.error('   Data:', JSON.stringify(error.response.data).substring(0, 500));
-        }
+        console.error('⚠️ Upstash error:', error.message);
         return { url: '', key: '', success: false, error: error.message };
+    }
+}
+
+// ============================================================
+// ID ANALYZER — HYBRID (Multipart first, JSON fallback)
+// ============================================================
+async function callIdAnalyzerMultipart(documentBase64, documentType) {
+    const form = new FormData();
+    form.append('document', Buffer.from(documentBase64, 'base64'), {
+        filename: 'document.jpg',
+        contentType: 'image/jpeg'
+    });
+    if (documentType) form.append('document_type', documentType);
+
+    console.log('🔍 ID Analyzer [1/2]: Trying multipart form...');
+
+    const response = await axios.post(ID_ANALYZER_ENDPOINT, form, {
+        headers: {
+            ...form.getHeaders(),
+            'X-API-KEY': ID_ANALYZER_API_KEY
+        },
+        timeout: 60000,
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
+        validateStatus: (status) => status >= 200 && status < 500
+    });
+
+    console.log(`🔍 ID Analyzer [1/2] status: ${response.status}`);
+
+    if (response.status >= 400) {
+        const errBody = response.data;
+        console.error('   Error:', JSON.stringify(errBody).substring(0, 300));
+        throw new Error('MULTIPART_FAILED: ' + (errBody.error?.message || 'Unknown'));
+    }
+
+    return response.data;
+}
+
+async function callIdAnalyzerJson(documentBase64, documentType) {
+    const payload = {
+        document: documentBase64
+    };
+    if (documentType) payload.document_type = documentType;
+
+    console.log('🔍 ID Analyzer [2/2]: Trying JSON base64...');
+
+    const response = await axios.post(ID_ANALYZER_ENDPOINT, payload, {
+        headers: {
+            'X-API-KEY': ID_ANALYZER_API_KEY,
+            'Content-Type': 'application/json'
+        },
+        timeout: 60000,
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
+        validateStatus: (status) => status >= 200 && status < 500
+    });
+
+    console.log(`🔍 ID Analyzer [2/2] status: ${response.status}`);
+
+    if (response.status >= 400) {
+        const errBody = response.data;
+        console.error('   Error:', JSON.stringify(errBody).substring(0, 300));
+        throw new Error('JSON_FAILED: ' + (errBody.error?.message || 'Unknown'));
+    }
+
+    return response.data;
+}
+
+async function callIdAnalyzerHybrid(documentBase64, documentType) {
+    // Attempt 1: Multipart
+    try {
+        const result = await callIdAnalyzerMultipart(documentBase64, documentType);
+        console.log('✅ ID Analyzer succeeded via MULTIPART');
+        return { result, method: 'multipart' };
+    } catch (e1) {
+        console.warn(`⚠️ Multipart failed: ${e1.message}`);
+    }
+
+    // Attempt 2: JSON
+    try {
+        const result = await callIdAnalyzerJson(documentBase64, documentType);
+        console.log('✅ ID Analyzer succeeded via JSON');
+        return { result, method: 'json' };
+    } catch (e2) {
+        console.error(`❌ JSON failed too: ${e2.message}`);
+        throw new Error('Both endpoints failed');
     }
 }
 
@@ -108,6 +185,7 @@ app.get('/', (req, res) => {
         status: 'ok',
         service: 'MeetIn KYC Server',
         storage: 'upstash-redis',
+        id_analyzer: 'hybrid (multipart → json)',
         timestamp: Date.now()
     });
 });
@@ -131,7 +209,7 @@ app.post('/scan', async (req, res) => {
         console.log(`📥 Scan request from device: ${deviceId}`);
         console.log(`   Document size: ${documentBase64.length} chars`);
 
-        // --- Upstash (non-fatal) ---
+        // --- 1. Upstash (non-fatal) ---
         const timestamp = Date.now();
         let uploadResult = { url: '', key: '', success: false };
         try {
@@ -140,63 +218,41 @@ app.post('/scan', async (req, res) => {
             console.warn('⚠️ Upstash threw:', e.message);
         }
 
-        // --- ID Analyzer ---
-        const form = new FormData();
-        form.append('document', Buffer.from(documentBase64, 'base64'), {
-            filename: 'document.jpg',
-            contentType: 'image/jpeg'
-        });
-        if (documentType) form.append('document_type', documentType);
-        form.append('verify_expiry', 'true');
-        form.append('verify_document_number', 'true');
-
-        console.log(`🔍 Calling ID Analyzer...`);
-
-        let idAnalyzerResponse;
+        // --- 2. ID Analyzer (hybrid) ---
+        let analyzerResult;
+        let method = 'unknown';
         try {
-            idAnalyzerResponse = await axios.post(ID_ANALYZER_ENDPOINT, form, {
-                headers: {
-                    ...form.getHeaders(),
-                    'X-API-KEY': ID_ANALYZER_API_KEY
-                },
-                timeout: 30000,
-                maxContentLength: Infinity,
-                maxBodyLength: Infinity,
-                validateStatus: (status) => status >= 200 && status < 500
-            });
-
-            console.log(`🔍 ID Analyzer status: ${idAnalyzerResponse.status}`);
-            if (idAnalyzerResponse.status >= 400) {
-                console.error('❌ ID Analyzer error body:', JSON.stringify(idAnalyzerResponse.data).substring(0, 500));
-                console.error('   API key prefix:', ID_ANALYZER_API_KEY.substring(0, 8) + '...');
-            }
+            const hybridResult = await callIdAnalyzerHybrid(documentBase64, documentType);
+            analyzerResult = hybridResult.result;
+            method = hybridResult.method;
         } catch (apiError) {
-            console.error('❌ ID Analyzer request exception:', apiError.message);
+            console.error('❌ ID Analyzer total failure:', apiError.message);
+
             const kycData = {
                 kyc_status: 'rejected',
                 kyc_decision: 'error',
                 kyc_submitted_at: timestamp,
                 kyc_verified_at: Date.now(),
-                kyc_rejected_reason: 'Could not reach ID Analyzer: ' + apiError.message
+                kyc_rejected_reason: 'ID Analyzer unavailable: ' + apiError.message
             };
             await db.ref(`devices/${deviceId}/kyc`).set(kycData);
             return res.json({
                 approved: false,
                 decision: 'error',
-                message: 'Verification service unavailable. Try again.',
+                message: 'Verification service unavailable. Try again.'
             });
         }
 
-        const result = idAnalyzerResponse.data || {};
-        const decision = result.decision || 'reject';
+        // --- 3. Parse ---
+        const decision = analyzerResult.decision || 'reject';
         const approved = decision === 'accept';
 
         let name = '';
         let documentNumber = '';
         let expiry = '';
 
-        if (result.result) {
-            const r = result.result;
+        if (analyzerResult.result) {
+            const r = analyzerResult.result;
             if (r.firstName || r.lastName) {
                 name = [r.firstName, r.lastName].filter(Boolean).join(' ').trim();
             } else if (r.fullName) {
@@ -206,7 +262,7 @@ app.post('/scan', async (req, res) => {
             expiry = r.expiryDate || r.documentExpiry || '';
         }
 
-        // --- Save to Firebase ---
+        // --- 4. Save to Firebase ---
         const kycData = {
             kyc_status: approved ? 'approved' : 'rejected',
             kyc_document_type: documentType || 'auto',
@@ -217,18 +273,19 @@ app.post('/scan', async (req, res) => {
             kyc_document_key: uploadResult.key || '',
             kyc_storage_provider: 'upstash',
             kyc_decision: decision,
+            kyc_api_method: method,
             kyc_submitted_at: timestamp,
             kyc_verified_at: Date.now(),
-            kyc_rejected_reason: approved ? '' : (result.error?.message || 'Document could not be verified')
+            kyc_rejected_reason: approved ? '' : (analyzerResult.error?.message || 'Document could not be verified')
         };
 
         await db.ref(`devices/${deviceId}/kyc`).set(kycData);
         await db.ref(`devices/${deviceId}/kyc_history/${timestamp}`).set({
             ...kycData,
-            raw_response: JSON.stringify(result).substring(0, 5000)
+            raw_response: JSON.stringify(analyzerResult).substring(0, 5000)
         });
 
-        console.log(`✅ KYC saved for ${deviceId}: ${decision}`);
+        console.log(`✅ KYC saved for ${deviceId}: ${decision} (via ${method})`);
 
         res.json({
             approved,
@@ -237,7 +294,8 @@ app.post('/scan', async (req, res) => {
             documentNumber,
             expiry,
             documentUrl: uploadResult.url || '',
-            message: approved ? 'Document verified successfully' : (result.error?.message || 'Document could not be verified'),
+            method,
+            message: approved ? 'Document verified successfully' : (analyzerResult.error?.message || 'Document could not be verified'),
             processingTime: Date.now() - startTime
         });
 
@@ -247,19 +305,6 @@ app.post('/scan', async (req, res) => {
             console.error('   Status:', error.response.status);
             console.error('   Data:', JSON.stringify(error.response.data).substring(0, 500));
         }
-        try {
-            const { deviceId } = req.body;
-            if (deviceId) {
-                await db.ref(`devices/${deviceId}/kyc`).set({
-                    kyc_status: 'rejected',
-                    kyc_decision: 'error',
-                    kyc_submitted_at: Date.now(),
-                    kyc_verified_at: Date.now(),
-                    kyc_rejected_reason: error.message
-                });
-            }
-        } catch (e) {}
-
         res.status(500).json({
             approved: false,
             decision: 'error',
@@ -292,7 +337,7 @@ app.get('/pending', async (req, res) => {
 });
 
 // ============================================================
-// /approve (manual admin override)
+// /approve
 // ============================================================
 app.post('/approve', async (req, res) => {
     try {
@@ -318,5 +363,5 @@ app.listen(PORT, () => {
     console.log(`🚀 MeetIn KYC Server running on port ${PORT}`);
     console.log(`📊 Firebase DB: ${FIREBASE_DB_URL}`);
     console.log(`📦 Storage: Upstash Redis`);
-    console.log(`🔑 ID Analyzer key: ${ID_ANALYZER_API_KEY.substring(0, 8)}...`);
+    console.log(`🔑 ID Analyzer: HYBRID (multipart → json)`);
 });
