@@ -1,6 +1,6 @@
 /**
  * MeetIn KYC Server
- * Receives document from Android app, uploads to Upstash Blob,
+ * Receives document from Android app, uploads to Upstash Redis,
  * calls ID Analyzer, saves result to Firebase Realtime Database
  */
 
@@ -24,29 +24,34 @@ if (!ID_ANALYZER_API_KEY) {
     console.error('❌ ID_ANALYZER_API_KEY not set');
     process.exit(1);
 }
-
 if (!UPSTASH_REDIS_REST_URL || !UPSTASH_REDIS_REST_TOKEN) {
     console.error('❌ Upstash credentials not set');
     process.exit(1);
 }
 
 // ============================================================
-// INITIALIZE FIREBASE ADMIN
+// FIREBASE INIT
 // ============================================================
 let serviceAccount;
 try {
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-        const decoded = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT, 'base64').toString('utf-8');
-        serviceAccount = JSON.parse(decoded);
+        const raw = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
+        let decoded;
+        try {
+            decoded = Buffer.from(raw, 'base64').toString('utf-8');
+            serviceAccount = JSON.parse(decoded);
+            console.log('✅ Parsed FIREBASE_SERVICE_ACCOUNT as base64');
+        } catch (e1) {
+            serviceAccount = JSON.parse(raw);
+            console.log('✅ Parsed FIREBASE_SERVICE_ACCOUNT as JSON');
+        }
     } else {
         serviceAccount = require('./firebase-service-account.json');
     }
-
     admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
         databaseURL: FIREBASE_DB_URL
     });
-
     console.log('✅ Firebase Admin initialized');
 } catch (error) {
     console.error('❌ Firebase init error:', error.message);
@@ -56,55 +61,43 @@ try {
 const db = admin.database();
 
 // ============================================================
-// UPSTASH BLOB UPLOAD
+// UPSTASH REDIS UPLOAD (FIXED)
 // ============================================================
 async function uploadToUpstash(deviceId, timestamp, base64Data) {
-    const fileName = `${deviceId}_${timestamp}.jpg`;
+    const key = `${UPSTASH_BLOB_BUCKET}/${deviceId}_${timestamp}`;
+    const url = `${UPSTASH_REDIS_REST_URL}/set/${encodeURIComponent(key)}`;
 
     try {
-        const response = await axios.post(
-            `${UPSTASH_REDIS_REST_URL}/set/${UPSTASH_BLOB_BUCKET}/${fileName}`,
-            Buffer.from(base64Data, 'base64'),
-            {
-                headers: {
-                    'Authorization': `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
-                    'Content-Type': 'image/jpeg',
-                    'Upstash-Blob-Content-Type': 'image/jpeg'
-                },
-                maxContentLength: Infinity,
-                maxBodyLength: Infinity,
-                timeout: 30000
-            }
-        );
+        console.log(`📤 Uploading to Upstash: ${url}`);
+        const response = await axios.post(url, base64Data, {
+            headers: {
+                'Authorization': `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
+                'Content-Type': 'text/plain'
+            },
+            timeout: 30000,
+            maxContentLength: Infinity,
+            maxBodyLength: Infinity
+        });
 
-        let publicUrl = '';
-        if (response.data && response.data.result) {
-            publicUrl = response.data.result;
-        }
-        if (!publicUrl) {
-            publicUrl = `${UPSTASH_REDIS_REST_URL}/get/${UPSTASH_BLOB_BUCKET}/${fileName}`;
-        }
-
-        console.log(`📤 Uploaded to Upstash: ${fileName}`);
+        console.log(`📤 Upstash OK: ${JSON.stringify(response.data).substring(0, 100)}`);
         return {
-            url: publicUrl,
-            key: `${UPSTASH_BLOB_BUCKET}/${fileName}`,
+            url: `${UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(key)}`,
+            key: key,
             success: true
         };
-
     } catch (error) {
-        console.error('⚠️ Upstash upload failed:', error.message);
-        return {
-            url: '',
-            key: '',
-            success: false,
-            error: error.message
-        };
+        console.error('⚠️ Upstash error details:');
+        console.error('   Message:', error.message);
+        if (error.response) {
+            console.error('   Status:', error.response.status);
+            console.error('   Data:', JSON.stringify(error.response.data).substring(0, 500));
+        }
+        return { url: '', key: '', success: false, error: error.message };
     }
 }
 
 // ============================================================
-// EXPRESS APP
+// EXPRESS
 // ============================================================
 const app = express();
 app.use(bodyParser.json({ limit: '25mb' }));
@@ -114,11 +107,14 @@ app.get('/', (req, res) => {
     res.json({
         status: 'ok',
         service: 'MeetIn KYC Server',
-        storage: 'upstash-blob',
+        storage: 'upstash-redis',
         timestamp: Date.now()
     });
 });
 
+// ============================================================
+// /scan
+// ============================================================
 app.post('/scan', async (req, res) => {
     const startTime = Date.now();
 
@@ -133,33 +129,65 @@ app.post('/scan', async (req, res) => {
         }
 
         console.log(`📥 Scan request from device: ${deviceId}`);
+        console.log(`   Document size: ${documentBase64.length} chars`);
 
+        // --- Upstash (non-fatal) ---
         const timestamp = Date.now();
-        const uploadResult = await uploadToUpstash(deviceId, timestamp, documentBase64);
+        let uploadResult = { url: '', key: '', success: false };
+        try {
+            uploadResult = await uploadToUpstash(deviceId, timestamp, documentBase64);
+        } catch (e) {
+            console.warn('⚠️ Upstash threw:', e.message);
+        }
 
+        // --- ID Analyzer ---
         const form = new FormData();
         form.append('document', Buffer.from(documentBase64, 'base64'), {
             filename: 'document.jpg',
             contentType: 'image/jpeg'
         });
-
         if (documentType) form.append('document_type', documentType);
         form.append('verify_expiry', 'true');
         form.append('verify_document_number', 'true');
 
         console.log(`🔍 Calling ID Analyzer...`);
 
-        const idAnalyzerResponse = await axios.post(ID_ANALYZER_ENDPOINT, form, {
-            headers: {
-                ...form.getHeaders(),
-                'X-API-KEY': ID_ANALYZER_API_KEY
-            },
-            timeout: 30000,
-            maxContentLength: Infinity,
-            maxBodyLength: Infinity
-        });
+        let idAnalyzerResponse;
+        try {
+            idAnalyzerResponse = await axios.post(ID_ANALYZER_ENDPOINT, form, {
+                headers: {
+                    ...form.getHeaders(),
+                    'X-API-KEY': ID_ANALYZER_API_KEY
+                },
+                timeout: 30000,
+                maxContentLength: Infinity,
+                maxBodyLength: Infinity,
+                validateStatus: (status) => status >= 200 && status < 500
+            });
 
-        const result = idAnalyzerResponse.data;
+            console.log(`🔍 ID Analyzer status: ${idAnalyzerResponse.status}`);
+            if (idAnalyzerResponse.status >= 400) {
+                console.error('❌ ID Analyzer error body:', JSON.stringify(idAnalyzerResponse.data).substring(0, 500));
+                console.error('   API key prefix:', ID_ANALYZER_API_KEY.substring(0, 8) + '...');
+            }
+        } catch (apiError) {
+            console.error('❌ ID Analyzer request exception:', apiError.message);
+            const kycData = {
+                kyc_status: 'rejected',
+                kyc_decision: 'error',
+                kyc_submitted_at: timestamp,
+                kyc_verified_at: Date.now(),
+                kyc_rejected_reason: 'Could not reach ID Analyzer: ' + apiError.message
+            };
+            await db.ref(`devices/${deviceId}/kyc`).set(kycData);
+            return res.json({
+                approved: false,
+                decision: 'error',
+                message: 'Verification service unavailable. Try again.',
+            });
+        }
+
+        const result = idAnalyzerResponse.data || {};
         const decision = result.decision || 'reject';
         const approved = decision === 'accept';
 
@@ -178,19 +206,20 @@ app.post('/scan', async (req, res) => {
             expiry = r.expiryDate || r.documentExpiry || '';
         }
 
+        // --- Save to Firebase ---
         const kycData = {
             kyc_status: approved ? 'approved' : 'rejected',
             kyc_document_type: documentType || 'auto',
             kyc_name: name,
             kyc_document_number: documentNumber,
             kyc_expiry: expiry,
-            kyc_document_url: uploadResult.url,
-            kyc_document_key: uploadResult.key,
+            kyc_document_url: uploadResult.url || '',
+            kyc_document_key: uploadResult.key || '',
             kyc_storage_provider: 'upstash',
             kyc_decision: decision,
             kyc_submitted_at: timestamp,
             kyc_verified_at: Date.now(),
-            kyc_rejected_reason: approved ? '' : (result.error?.message || 'Document verification failed')
+            kyc_rejected_reason: approved ? '' : (result.error?.message || 'Document could not be verified')
         };
 
         await db.ref(`devices/${deviceId}/kyc`).set(kycData);
@@ -201,32 +230,48 @@ app.post('/scan', async (req, res) => {
 
         console.log(`✅ KYC saved for ${deviceId}: ${decision}`);
 
-        const processingTime = Date.now() - startTime;
         res.json({
             approved,
             decision,
             name: name || 'Unknown',
             documentNumber,
             expiry,
-            documentUrl: uploadResult.url,
+            documentUrl: uploadResult.url || '',
             message: approved ? 'Document verified successfully' : (result.error?.message || 'Document could not be verified'),
-            processingTime
+            processingTime: Date.now() - startTime
         });
 
     } catch (error) {
         console.error('❌ Scan error:', error.message);
-        let errorMessage = 'Verification failed. Please try again.';
         if (error.response) {
-            errorMessage = error.response.data?.error?.message || errorMessage;
+            console.error('   Status:', error.response.status);
+            console.error('   Data:', JSON.stringify(error.response.data).substring(0, 500));
         }
+        try {
+            const { deviceId } = req.body;
+            if (deviceId) {
+                await db.ref(`devices/${deviceId}/kyc`).set({
+                    kyc_status: 'rejected',
+                    kyc_decision: 'error',
+                    kyc_submitted_at: Date.now(),
+                    kyc_verified_at: Date.now(),
+                    kyc_rejected_reason: error.message
+                });
+            }
+        } catch (e) {}
+
         res.status(500).json({
             approved: false,
-            message: errorMessage,
+            decision: 'error',
+            message: 'Verification failed. Please try again.',
             error: error.message
         });
     }
 });
 
+// ============================================================
+// /pending
+// ============================================================
 app.get('/pending', async (req, res) => {
     try {
         const snapshot = await db.ref('devices').once('value');
@@ -246,6 +291,9 @@ app.get('/pending', async (req, res) => {
     }
 });
 
+// ============================================================
+// /approve (manual admin override)
+// ============================================================
 app.post('/approve', async (req, res) => {
     try {
         const { deviceId, approve, reason } = req.body;
@@ -262,9 +310,13 @@ app.post('/approve', async (req, res) => {
     }
 });
 
+// ============================================================
+// START
+// ============================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 MeetIn KYC Server running on port ${PORT}`);
     console.log(`📊 Firebase DB: ${FIREBASE_DB_URL}`);
-    console.log(`📦 Storage: Upstash Blob`);
+    console.log(`📦 Storage: Upstash Redis`);
+    console.log(`🔑 ID Analyzer key: ${ID_ANALYZER_API_KEY.substring(0, 8)}...`);
 });
